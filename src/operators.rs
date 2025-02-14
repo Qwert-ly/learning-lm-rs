@@ -71,25 +71,71 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    assert_eq!(x.shape(), y.shape(), "x、y形状必须相同");
+    let x_shape = x.shape();
+    let d = x_shape.last().unwrap();
+    assert_eq!(w.shape(), &[*d], "w形状需匹配x的列数");
+    
+    let x_data = x.data();
+    let w_data = w.data();
+    let y_data = unsafe { y.data_mut() };
+    let num_samples = x.size() / d;
+    
+    for i in 0..num_samples {
+        let start = i * d;
+        let end = start + d;
+        let sum_sq: f32 = x_data[start..end].iter().map(|&v| v * v).sum();
+        let rms = (sum_sq / *d as f32 + epsilon).sqrt();
+        for j in 0..*d {
+            y_data[start + j] = x_data[start + j] / rms * w_data[j];
+        }
+    }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
-
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
-
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    let len = y.size();
+    assert_eq!(len, x.size(), "x、y长度必须相同");
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    
+    for i in 0..len {
+        let x_val = _x[i];
+        let sig = 1.0 / (1.0 + (-x_val).exp());
+        _y[i] *= x_val * sig;
+    }
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let c_shape = c.shape();
+    assert_eq!(a_shape.len(), 2, "a须是2维");
+    assert_eq!(b_shape.len(), 2, "b须是2维");
+    assert_eq!(c_shape.len(), 2, "c须是2维");
+    let (m, k_a) = (a_shape[0], a_shape[1]);
+    let (n, k_b) = (b_shape[0], b_shape[1]);
+    assert_eq!(k_a, k_b, "a的列须匹配b的列");
+    assert_eq!(c_shape[0], m, "c的行须匹配a的行");
+    assert_eq!(c_shape[1], n, "c的列须匹配b的行");
+    
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+    
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for k in 0..k_a {
+                sum += a_data[i * k_a + k] * b_data[j * k_b + k];
+            }
+            let idx = i * n + j;
+            c_data[idx] = beta * c_data[idx] + alpha * sum;
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
