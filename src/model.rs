@@ -100,18 +100,48 @@ impl Llama<f32> {
 
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
+    
+            self_attention(
+                &mut residual,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv,
+            );
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
+            // 完成下投影并加到残差连接上
+            OP::matmul_transb(
+                &mut residual,
+                1.0,
+                &hidden_states,
+                &self.params.wo[layer],
+                1.0
+            );
+            // todo!("down_proj matmul and add residual");
 
-            todo!("mlp(...)");
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps,
+            );
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &vec![1, self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -133,9 +163,27 @@ impl Llama<f32> {
         top_k: u32,
         temperature: f32,
     ) -> Vec<u32>{
-        let mut result = Vec::<u32>::new();
+        let mut result = token_ids.to_vec();
+        let mut cache = self.new_cache();
+        // 初始
+        let input = Tensor::new(result.clone(), &vec![result.len()]);
+        self.forward(&input, &mut cache);
         
-        todo!("实现文本生成");
+        for _ in 0..max_len {
+            let last_token = Tensor::new(vec![result[result.len() - 1]], &vec![1]);
+            
+            // forward得到下一Token概率
+            let logits = self.forward(&last_token, &mut cache);
+            
+            // 采样下一Token
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+            result.push(next_token);
+            
+            // 检查序列结束
+            if next_token == self.eos_token_id {
+                break;
+            }
+        }
         
         result
     }
@@ -153,7 +201,62 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+    // todo!("Implement self_attention");
+    let scale = (dqkv as f32).sqrt().recip();
+    
+    for h in 0..n_kv_h {
+        for g in 0..n_groups {
+            // 获取当前head的query切片
+            let q_head = q.slice(
+                (h * n_groups + g) * dqkv, 
+                &vec![seq_len, dqkv]
+            );
+            
+            // 获取当前head的key切片
+            let k_head = k.slice(
+                h * dqkv, 
+                &vec![total_seq_len, dqkv]
+            );
+            
+            // 获取当前head和group的scores切片
+            let scores = &mut att_scores.slice(
+                (h * n_groups + g) * seq_len * total_seq_len,
+                &vec![seq_len, total_seq_len],
+            );
+            
+            // 计算缩放后的点积注意力分数：(Q @ K.T) * scale
+            OP::matmul_transb(scores, 0.0, &q_head, &k_head, scale);
+        }
+    }
+
+    // Step 2: 应用softmax获取注意力权重
+    OP::masked_softmax(att_scores);
+
+    // Step 3: 计算value的加权和
+    for h in 0..n_kv_h {
+        // 获取当前head的value切片
+        let v_head = v.slice(
+            h * dqkv, 
+            &vec![dqkv, total_seq_len]
+        );
+        
+        for g in 0..n_groups {
+            // 获取当前head和group的注意力权重
+            let attn_probs = &att_scores.slice(
+                (h * n_groups + g) * seq_len * total_seq_len,
+                &vec![seq_len, total_seq_len],
+            );
+            
+            // 获取输出tensor的对应切片
+            let mut out_head = hidden_states.slice(
+                (h * n_groups + g) * dqkv,
+                &vec![seq_len, dqkv],
+            );
+            
+            // 计算最终的注意力输出：attn_probs @ V
+            OP::matmul_transb(&mut out_head, 0.0, &attn_probs, &v_head, 1.0);
+        }
+    }
 }
 
 fn mlp(
@@ -167,7 +270,19 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    todo!("Implement mlp");
+    // todo!("Implement mlp");
+    // Step 1: Apply RMS normalization to the input
+    OP::rms_norm(hidden_states, residual, rms_w, eps);
+
+    // Step 2: Compute gate and up-projection in parallel
+    OP::matmul_transb(gate, 0., hidden_states, w_gate, 1.0);
+    OP::matmul_transb(up, 0., hidden_states, w_up, 1.0);
+
+    // Step 3: Apply SwiGLU activation (gate * silu(up))
+    OP::swiglu(gate, up);
+
+    // Step 4: Compute down-projection and add to residual
+    OP::matmul_transb(residual, 1.0, gate, w_down, 1.0);
 }
 
 #[test]
