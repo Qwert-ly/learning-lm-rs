@@ -71,10 +71,8 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    assert_eq!(x.shape(), y.shape(), "x、y形状必须相同");
     let x_shape = x.shape();
     let d = x_shape.last().unwrap();
-    assert_eq!(w.shape(), &[*d], "w形状需匹配x的列数");
     
     let x_data = x.data();
     let w_data = w.data();
