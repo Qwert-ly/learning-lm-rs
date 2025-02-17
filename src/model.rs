@@ -7,7 +7,6 @@ use crate::operators as OP;
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
-use tokenizers::tokenizer;
 use std::path::Path;
 pub struct Llama<T> {
     vocab: usize,           // vocab size
@@ -103,7 +102,7 @@ impl Llama<f32> {
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
     
             self_attention(
-                &mut residual,
+                &mut hidden_states,
                 &mut att_scores,
                 q,
                 full_k,
@@ -142,7 +141,7 @@ impl Llama<f32> {
         // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![1, self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -155,74 +154,6 @@ impl Llama<f32> {
 
         logits
     }
-
-    pub fn analyze_probs(
-        &self,
-        logits: &Tensor<f32>,
-        temperature: f32,
-        top_k: u32,
-        top_p: f32,
-        tokenizer: &tokenizers::Tokenizer,
-    ) {
-        // 将logits转换为Vec<f32>
-        let logits_vec = logits.data().to_vec();
-        
-        // 应用温度缩放
-        let scaled_logits: Vec<f32> = logits_vec
-            .iter()
-            .map(|&v| v / temperature)
-            .collect();
-        
-        // 计算softmax（带数值稳定性处理）
-        let max_logit = scaled_logits
-            .iter()
-            .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let exp_sum: f32 = scaled_logits
-            .iter()
-            .map(|&v| (v - max_logit).exp())
-            .sum();
-        let probs: Vec<f32> = scaled_logits
-            .iter()
-            .map(|&v| (v - max_logit).exp() / exp_sum)
-            .collect();
-        
-        // 创建带索引的概率列表
-        let mut indexed_probs: Vec<(usize, f32)> = 
-            probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-        
-        // 按概率降序排序
-        indexed_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        
-        // 应用top-k过滤
-        let top_k = top_k as usize;
-        let filtered_probs = if top_k > 0 && top_k < indexed_probs.len() {
-            &indexed_probs[0..top_k]
-        } else {
-            &indexed_probs
-        };
-        
-        // 应用top-p过滤（需要累积概率）
-        let mut cum_prob = 0.0;
-        let mut top_p_index = filtered_probs.len();
-        for (i, (_, prob)) in filtered_probs.iter().enumerate() {
-            cum_prob += prob;
-            if cum_prob >= top_p as f32 {
-                top_p_index = i + 1;
-                break;
-            }
-        }
-        let final_probs = &filtered_probs[0..top_p_index];
-        
-        // 打印Top 10信息
-        println!("\n=== Token / {} Generation Analysis ===", final_probs.len());
-        for (i, (token_id, prob)) in final_probs.iter().take(5).enumerate() {
-            println!("{:6} ({:?})\t\t {:.4}%", 
-                *token_id as u32,
-                tokenizer.decode(&[*token_id as u32], true).unwrap(),
-                prob * 100.0
-            );
-        }
-    }
     
 
     pub fn generate(
@@ -232,23 +163,19 @@ impl Llama<f32> {
         top_p: f32,
         top_k: u32,
         temperature: f32,
-        tk: &tokenizers::Tokenizer,
     ) -> Vec<u32>{
-        let mut result = token_ids.to_vec();
+        let mut result = Vec::<u32>::new();
         let mut cache = self.new_cache();
         // 初始
-        let input = Tensor::new(result.clone(), &vec![result.len()]);
-        let logits = self.forward(&input, &mut cache);
-        self.analyze_probs(&logits, temperature, top_k, top_p, tk);
-        // self.forward(&input, &mut cache);
+        let mut input_token = token_ids.to_vec();
+        if input_token[0] != self.bos_token_id {
+            input_token.insert(0, self.bos_token_id);
+        }
+        let mut last_token = Tensor::new(input_token, &vec![1, token_ids.len()]);
         
         for _ in 0..max_len {
-            let last_token = Tensor::new(vec![result[result.len() - 1]], &vec![1]);
-            
             // forward得到下一Token概率
             let logits = self.forward(&last_token, &mut cache);
-
-            self.analyze_probs(&logits, temperature, top_k, top_p, tk);
             
             // 采样下一Token
             let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
@@ -258,6 +185,7 @@ impl Llama<f32> {
             if next_token == self.eos_token_id {
                 break;
             }
+            last_token = Tensor::new(Vec::from([next_token]), &vec![1, 1]);
         }
         
         result
@@ -277,30 +205,25 @@ fn self_attention(
     dqkv: usize,
 ) {
     // todo!("Implement self_attention");
+    let _q = q.data();
+    let _k = k.data();
+    let _v = v.data();
+    let _a = unsafe { att_scores.data_mut() };
     let scale = (dqkv as f32).sqrt().recip();
-    
-    for h in 0..n_kv_h {
-        for g in 0..n_groups {
-            // 获取当前head的query切片
-            let q_head = q.slice(
-                (h * n_groups + g) * dqkv, 
-                &vec![seq_len, dqkv]
-            );
-            
-            // 获取当前head的key切片
-            let k_head = k.slice(
-                h * dqkv, 
-                &vec![total_seq_len, dqkv]
-            );
-            
-            // 获取当前head和group的scores切片
-            let scores = &mut att_scores.slice(
-                (h * n_groups + g) * seq_len * total_seq_len,
-                &vec![seq_len, total_seq_len],
-            );
-            
-            // 计算缩放后的点积注意力分数：(Q @ K.T) * scale
-            OP::matmul_transb(scores, 0.0, &q_head, &k_head, scale);
+    let N = n_kv_h * dqkv;
+
+    for h in 0..n_kv_h * n_groups {
+        for l in 0..seq_len {
+            let q_index = l * N * n_groups + h * dqkv;
+            for i in 0..total_seq_len {
+                let mut sum = 0.0;
+                let k_index = i * N + h / n_groups * dqkv;
+                for j in 0..dqkv {
+                    sum += _q[q_index + j] * _k[k_index + j];
+                }
+                let att_idx = h * seq_len * total_seq_len + l * total_seq_len + i;
+                _a[att_idx] = sum * scale;
+            }
         }
     }
 
@@ -308,28 +231,19 @@ fn self_attention(
     OP::masked_softmax(att_scores);
 
     // Step 3: 计算value的加权和
-    for h in 0..n_kv_h {
-        // 获取当前head的value切片
-        let v_head = v.slice(
-            h * dqkv, 
-            &vec![dqkv, total_seq_len]
-        );
-        
-        for g in 0..n_groups {
-            // 获取当前head和group的注意力权重
-            let attn_probs = &att_scores.slice(
-                (h * n_groups + g) * seq_len * total_seq_len,
-                &vec![seq_len, total_seq_len],
-            );
-            
-            // 获取输出tensor的对应切片
-            let mut out_head = hidden_states.slice(
-                (h * n_groups + g) * dqkv,
-                &vec![seq_len, dqkv],
-            );
-            
-            // 计算最终的注意力输出：attn_probs @ V
-            OP::matmul_transb(&mut out_head, 0.0, &attn_probs, &v_head, 1.0);
+    let _a = att_scores.data();
+    let _h = unsafe { hidden_states.data_mut() };
+    for h in 0..n_kv_h * n_groups {
+        for l in 0..seq_len {
+            let a_index = h * seq_len * total_seq_len + l * total_seq_len;
+            for i in 0..dqkv {
+                let mut sum = 0.0;
+                let v_index = i + h / n_groups * dqkv;
+                for j in 0..total_seq_len {
+                    sum += _a[a_index + j] * _v[v_index + j * N];
+                }
+                _h[l * N * n_groups + h * dqkv + i] = sum;
+            }
         }
     }
 }
@@ -354,10 +268,10 @@ fn mlp(
     OP::matmul_transb(up, 0., hidden_states, w_up, 1.0);
 
     // Step 3: Apply SwiGLU activation (gate * silu(up))
-    OP::swiglu(gate, up);
+    OP::swiglu(up, gate);
 
     // Step 4: Compute down-projection and add to residual
-    OP::matmul_transb(residual, 1.0, gate, w_down, 1.0);
+    OP::matmul_transb(residual, 1.0, up, w_down, 1.0);
 }
 
 #[test]
